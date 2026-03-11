@@ -1304,6 +1304,12 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) {
 
 	// No ClearHookBead call needed — agent bead hook slot is no longer maintained (hq-l6mm5).
 
+	// Purge closed ephemeral beads (wisps) accumulated during this and prior sessions.
+	// Without this, closed wisps from mol-polecat-work steps, mol-witness-patrol cycles,
+	// etc. accumulate across sessions and pollute bd ready/list output (hq-6161m).
+	// Best-effort: failures are non-fatal since the work is already done.
+	purgeClosedEphemeralBeads(bd)
+
 	// Self-managed completion (gt-1qlg, polecat-self-managed-completion.md Phase 2):
 	// Polecat sets agent_state=idle directly, skipping the intermediate "done" state.
 	// The witness is no longer in the critical path for routine completions.
@@ -1484,4 +1490,25 @@ func selfKillSession(townRoot string, roleInfo RoleInfo) error {
 	}
 
 	return nil
+}
+
+// purgeClosedEphemeralBeads removes closed ephemeral beads (wisps) that accumulated
+// during this and prior sessions. Polecat/witness sessions create mol-polecat-work
+// steps, mol-witness-patrol cycles, etc. as wisps. These get closed during normal
+// operation but are never deleted, accumulating hundreds of rows that pollute
+// bd ready/list output. (hq-6161m)
+//
+// Best-effort: errors are logged but don't block gt done completion.
+func purgeClosedEphemeralBeads(bd *beads.Beads) {
+	out, err := bd.Run("purge", "--force", "--quiet")
+	if err != nil {
+		// Non-fatal: purge failure shouldn't block session completion
+		fmt.Fprintf(os.Stderr, "Warning: wisp purge failed: %v\n", err)
+		return
+	}
+	// bd purge --force --quiet outputs the count of purged beads
+	outStr := strings.TrimSpace(string(out))
+	if outStr != "" && outStr != "0" {
+		fmt.Fprintf(os.Stderr, "Purged closed ephemeral beads: %s\n", outStr)
+	}
 }
