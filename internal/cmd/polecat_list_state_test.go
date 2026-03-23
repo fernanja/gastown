@@ -21,12 +21,14 @@ func TestEffectivePolecatState(t *testing.T) {
 			want: polecat.StateWorking,
 		},
 		{
-			name: "session-dead-working-becomes-done",
+			// Kaizen 2026-03-23: without town.log, session-dead+working → crashed
+			// (no [done] entry means polecat didn't complete)
+			name: "session-dead-working-becomes-crashed-without-townlog",
 			item: PolecatListItem{
 				State:          polecat.StateWorking,
 				SessionRunning: false,
 			},
-			want: polecat.StateDone,
+			want: polecat.StateCrashed,
 		},
 		{
 			name: "zombie-is-never-rewritten",
@@ -57,11 +59,12 @@ func TestEffectivePolecatState(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := effectivePolecatState(tt.item)
+			// Pass empty townRoot — without a valid town.log, crashed is the
+			// correct inference for session-dead+working (safer than assuming done).
+			got := effectivePolecatState(tt.item, "")
 			if got != tt.want {
 				t.Fatalf("effectivePolecatState() = %q, want %q", got, tt.want)
 			}
 		})
 	}
 }
-

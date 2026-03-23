@@ -51,6 +51,13 @@ const (
 	// This is a detected condition: the polecat was incompletely nuked or has a
 	// session naming mismatch, leaving an orphaned tmux session.
 	StateZombie State = "zombie"
+
+	// StateCrashed means the polecat's session died without calling gt done.
+	// Detected when: session is not running, state is still "working", and no
+	// [done] entry exists in town.log for this polecat. This distinguishes a
+	// polecat that completed successfully from one that died mid-work.
+	// Kaizen 2026-03-23: silent session death was misreported as "done".
+	StateCrashed State = "crashed"
 )
 
 // IsWorking returns true if the polecat is currently working.

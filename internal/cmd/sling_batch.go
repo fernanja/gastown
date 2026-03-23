@@ -123,20 +123,33 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 
 	// Dispatch each bead via executeSling
 	for i, beadID := range beadIDs {
-		// Admission control: throttle spawns when --max-concurrent is set
-		if slingMaxConcurrent > 0 && activeCount >= slingMaxConcurrent {
-			fmt.Printf("\n%s Max concurrent limit reached (%d), waiting for capacity...\n",
-				style.Warning.Render("⏳"), slingMaxConcurrent)
-			// Wait for sessions to settle before spawning more
-			for wait := 0; wait < 30; wait++ {
-				time.Sleep(2 * time.Second)
-				if wait >= 2 {
+		// Admission control: throttle spawns when --max-concurrent is set.
+		// Kaizen 2026-03-23: replaced naive time-based batching with real polecat
+		// counting. The old approach reset activeCount after a sleep, which allowed
+		// spawning beyond the limit. Now we poll actual tmux sessions until capacity
+		// is available. Default limit of 5 prevents silent session death from
+		// Claude API concurrent session limits.
+		effectiveLimit := slingMaxConcurrent
+		if effectiveLimit <= 0 {
+			effectiveLimit = 5 // Default: 5 concurrent polecats (observed safe limit)
+		}
+		currentActive := countActivePolecats()
+		if currentActive >= effectiveLimit {
+			fmt.Printf("\n%s Concurrent polecat limit reached (%d/%d), waiting for capacity...\n",
+				style.Warning.Render("⏳"), currentActive, effectiveLimit)
+			for attempt := 0; attempt < 60; attempt++ { // Wait up to 5 min
+				time.Sleep(5 * time.Second)
+				currentActive = countActivePolecats()
+				if currentActive < effectiveLimit {
+					fmt.Printf("  %s Capacity available (%d/%d), resuming dispatch\n",
+						style.Success.Render("✓"), currentActive, effectiveLimit)
 					break
 				}
 			}
-			// Reset counter after cooldown — polecats become self-sufficient
-			// quickly, so we use time-based batching rather than precise counting
-			activeCount = 0
+			if currentActive >= effectiveLimit {
+				fmt.Printf("  %s Timed out waiting for capacity, proceeding anyway\n",
+					style.Warning.Render("⚠"))
+			}
 		}
 
 		fmt.Printf("\n[%d/%d] Slinging %s...\n", i+1, len(beadIDs), beadID)

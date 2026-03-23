@@ -99,16 +99,20 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 		return nil, fmt.Errorf("admission control: %w", err)
 	}
 
-	// Polecat count cap (clown show #22): refuse to spawn if there are already
-	// too many active polecats. This is a last-resort safety net for the direct-dispatch
-	// path. For configurable capacity gating, use scheduler.max_polecats in town settings
+	// Polecat count cap: refuse to spawn if there are already too many active polecats.
+	// Kaizen 2026-03-23: lowered from 25 to 8 after discovering Claude Code has an
+	// effective per-account concurrent session limit (~5). Sessions beyond this limit
+	// start tmux but Claude never responds — they die silently. The cap of 8 provides
+	// some headroom above the observed ~5 limit while preventing spawn storms.
+	// For configurable capacity gating, use scheduler.max_polecats in town settings
 	// (see internal/scheduler/capacity/).
-	const defaultMaxActivePolecats = 25
+	const defaultMaxActivePolecats = 8
 	activeCount := countActivePolecats()
 	if activeCount >= defaultMaxActivePolecats {
 		return nil, fmt.Errorf("polecat cap reached: %d active polecats (max %d). "+
-			"This is a safety limit to prevent spawn storms. "+
-			"Investigate why polecats are accumulating before spawning more",
+			"Claude Code has a concurrent session limit (~5). "+
+			"Wait for polecats to complete before spawning more. "+
+			"Use --max-concurrent to set a batch limit",
 			activeCount, defaultMaxActivePolecats)
 	}
 
@@ -417,13 +421,29 @@ func (s *SpawnedPolecatInfo) StartSession() (string, error) {
 		style.PrintWarning("could not update issue status to in_progress: %v", err)
 	}
 
-	// Get pane — if this fails, the session may have died during startup.
-	// Kill the dead session to prevent "session already running" on next attempt (gt-jn40ft).
+	// Post-start health check: verify session is actually alive and responsive.
+	// Kaizen 2026-03-23: sessions can appear "started" (tmux exists) but Claude never
+	// responds. This was observed when >5 concurrent sessions hit Claude API limits.
+	// The WaitForRuntimeReady above only warns on timeout — this check is stricter.
 	pane, err := getSessionPane(s.SessionName)
 	if err != nil {
 		// Session likely died — clean up the tmux session so it doesn't block re-sling
 		_ = t.KillSession(s.SessionName)
 		return "", fmt.Errorf("getting pane for %s (session likely died during startup): %w", s.SessionName, err)
+	}
+
+	// Verify session activity: check that tmux pane has received output.
+	// A dead session will have an empty or minimal pane (just the shell prompt).
+	// We check pane content length as a proxy for "Claude actually started".
+	captureCmd := tmux.BuildCommand("capture-pane", "-t", s.SessionName, "-p")
+	if captureOut, captureErr := captureCmd.Output(); captureErr == nil {
+		content := strings.TrimSpace(string(captureOut))
+		if len(content) < 10 {
+			// Pane has very little content — session may not have started properly.
+			// This is a warning, not a hard failure, since some agents are slow to start.
+			style.PrintWarning("session %s has minimal output (%d chars) — may not have started properly. "+
+				"Check with: gt polecat status %s/%s", s.SessionName, len(content), s.RigName, s.PolecatName)
+		}
 	}
 
 	s.Pane = pane

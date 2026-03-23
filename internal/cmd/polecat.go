@@ -17,7 +17,9 @@ import (
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
+	"github.com/steveyegge/gastown/internal/townlog"
 	"github.com/steveyegge/gastown/internal/util"
+	"github.com/steveyegge/gastown/internal/workspace"
 )
 
 // Polecat command flags
@@ -392,7 +394,12 @@ type PolecatListItem struct {
 // effectivePolecatState returns the observable state used by polecat list output.
 // Session liveness is ground truth for working/idle/done transitions. Zombie entries
 // are never auto-rewritten.
-func effectivePolecatState(item PolecatListItem) polecat.State {
+//
+// Kaizen 2026-03-23: When session is dead and state is "working", we now check
+// town.log for a [done] entry before reporting "done". Without this check, crashed
+// polecats (sessions that died without calling gt done) were misreported as "done",
+// causing the mayor to think work completed when it hadn't.
+func effectivePolecatState(item PolecatListItem, townRoot string) polecat.State {
 	state := item.State
 	// A running session overrides both "done" and "idle" — the polecat is working.
 	// "idle" can be stale when a polecat is reused (cross-rig beads, stale heartbeat,
@@ -401,9 +408,50 @@ func effectivePolecatState(item PolecatListItem) polecat.State {
 		return polecat.StateWorking
 	}
 	if !item.SessionRunning && !item.Zombie && state == polecat.StateWorking {
-		return polecat.StateDone
+		// Check town.log for [done] entry — only report "done" if the polecat
+		// actually called gt done. Otherwise it crashed mid-work.
+		if hasDoneInTownLog(townRoot, item.Rig, item.Name, item.Issue) {
+			return polecat.StateDone
+		}
+		return polecat.StateCrashed
 	}
 	return state
+}
+
+// hasDoneInTownLog checks if a polecat has a [done] entry in town.log.
+// This is the authoritative proof of completion — session status alone is unreliable.
+func hasDoneInTownLog(townRoot, rigName, polecatName, issue string) bool {
+	if townRoot == "" {
+		return false // Can't check without town root, fall back to "done" assumption
+	}
+	// Read recent events (last 200 to avoid full log scan)
+	events, err := townlog.TailEvents(townRoot, 200)
+	if err != nil {
+		return false // Can't read log, assume crashed (safer)
+	}
+	// Look for a [done] event matching this polecat
+	agentPrefix := fmt.Sprintf("%s/polecats/%s", rigName, polecatName)
+	done := townlog.FilterEvents(events, townlog.Filter{
+		Type:  townlog.EventDone,
+		Agent: agentPrefix,
+	})
+	// If we have [done] events, check if any match the current issue
+	if len(done) > 0 {
+		if issue == "" {
+			return true // No issue to match, any done is good
+		}
+		// Check the most recent done event for this polecat
+		for i := len(done) - 1; i >= 0; i-- {
+			if strings.Contains(done[i].Context, issue) {
+				return true
+			}
+		}
+		// Has done entries but none match current issue — could be from
+		// a previous assignment. Return true to avoid false "crashed" for
+		// polecats that completed but changed issues.
+		return true
+	}
+	return false
 }
 
 // getPolecatManager creates a polecat manager for the given rig.
@@ -493,9 +541,12 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Resolve town root for town.log check in effectivePolecatState
+	townRoot, _ := workspace.FindFromCwdOrError()
+
 	// Output
 	for i := range allPolecats {
-		allPolecats[i].State = effectivePolecatState(allPolecats[i])
+		allPolecats[i].State = effectivePolecatState(allPolecats[i], townRoot)
 	}
 
 	if polecatListJSON {
@@ -527,6 +578,8 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 		case polecat.StateDone:
 			stateStr = style.Success.Render(stateStr)
 		case polecat.StateZombie:
+			stateStr = style.Error.Render(stateStr)
+		case polecat.StateCrashed:
 			stateStr = style.Error.Render(stateStr)
 		default:
 			stateStr = style.Dim.Render(stateStr)
