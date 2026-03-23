@@ -92,7 +92,8 @@ func isDoltConfigError(err error) bool {
 		strings.Contains(msg, "connection refused") ||
 		strings.Contains(msg, "configure custom types") ||
 		strings.Contains(msg, "identity mismatch") ||
-		strings.Contains(msg, "Unknown database")
+		strings.Contains(msg, "Unknown database") ||
+		strings.Contains(msg, "unknown command") // hq-xqfo: bd agent state doesn't exist yet
 }
 
 // Common errors
