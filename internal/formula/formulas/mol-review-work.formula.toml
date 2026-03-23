@@ -1,0 +1,124 @@
+description = """
+Lightweight polecat formula for proposal review tasks.
+
+This molecule guides a polecat through a review-only assignment. Unlike
+mol-polecat-work (which includes build/test/CI steps), this formula has
+only 3 steps: load context, run the review, commit and exit.
+
+## Polecat Contract
+
+You are a review worker. You:
+1. Receive work via your hook (review command + proposal reference)
+2. Run the specified review command — do NOT run a different review type
+3. Commit your review output and exit via `gt done`
+
+**The review command is mandatory.** It is injected via `{{review_command}}`.
+You MUST run exactly that command, not a different review type.
+
+**You do NOT:**
+- Run build, test, lint, or typecheck commands
+- Submit to the merge queue (your work is merged locally by the mayor)
+- Wait for refinery verdict
+- Process self-review or request-review steps
+
+## Variables
+
+| Variable | Source | Description |
+|----------|--------|-------------|
+| issue | hook_bead | The issue ID you're assigned to work on |
+| review_command | sling vars | The exact review skill to run (e.g., /review-proposal-tech) |
+| review_args | sling vars | Arguments for the review command (e.g., unify-milestones-ux) |
+| base_branch | sling vars | Base branch (default: main) |"""
+formula = "mol-review-work"
+version = 1
+
+[[steps]]
+id = "load-context"
+title = "Load context and verify assignment"
+description = """
+**1. Prime your environment:**
+```bash
+gt prime
+```
+
+**2. Check your hook:**
+```bash
+gt hook
+```
+
+The hook_bead is your assigned review issue. Read it:
+```bash
+bd show {{issue}}
+```
+
+**3. Understand your assignment:**
+You MUST run: `{{review_command}} {{review_args}}`
+
+This is not a suggestion — it is your exact assignment. Do NOT run a
+different review type. Do NOT skip the review command.
+
+**Exit criteria:** You understand which review to run and on which proposal."""
+
+[[steps]]
+id = "run-review"
+title = "Execute the review"
+needs = ["load-context"]
+description = """
+Run the assigned review command:
+
+```
+{{review_command}} {{review_args}}
+```
+
+This will guide you through the full review process including reading the
+proposal, evaluating against review criteria, documenting findings, and
+writing the review output to a per-type review file.
+
+**CRITICAL:** The review skill will tell you to write to a per-type file
+(e.g., `review-tech.md`). Follow those instructions exactly.
+
+**Persist findings as you go:**
+Your session can die at any time. The review output file is your
+deliverable — commit frequently so work survives crashes:
+```bash
+git add openspec/changes/{{review_args}}/review-*.md
+git commit -m "WIP: review progress for {{review_args}} ({{issue}})"
+```
+
+**Exit criteria:** Review complete, findings written to per-type review file."""
+
+[[steps]]
+id = "commit-and-exit"
+title = "Commit and exit"
+needs = ["run-review"]
+description = """
+Your review is done. Commit, push, and exit.
+
+```bash
+git add -A
+git commit -m "review: {{review_command}} for {{review_args}} ({{issue}})"
+git push origin HEAD
+gt done --cleanup-status clean
+```
+
+Do NOT proceed through any other formula steps. You are DONE.
+
+**Exit criteria:** Changes committed, pushed, gt done called."""
+
+[vars]
+[vars.issue]
+description = "The issue ID assigned to this polecat"
+required = true
+
+[vars.review_command]
+description = "The exact review skill to run (e.g., /review-proposal-tech)"
+required = true
+
+[vars.review_args]
+description = "Arguments for the review command (e.g., unify-milestones-ux)"
+required = true
+default = ""
+
+[vars.base_branch]
+description = "Base branch (default: main)"
+default = "main"
