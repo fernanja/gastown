@@ -99,6 +99,7 @@ func isDoltConfigError(err error) bool {
 var (
 	ErrPolecatExists      = errors.New("polecat already exists")
 	ErrPolecatNotFound    = errors.New("polecat not found")
+	ErrPolecatNotIdle     = errors.New("polecat is no longer idle")
 	ErrHasChanges         = errors.New("polecat has uncommitted changes")
 	ErrHasUncommittedWork = errors.New("polecat has uncommitted work")
 	ErrShellInWorktree    = errors.New("shell working directory is inside polecat worktree")
@@ -1526,6 +1527,21 @@ func (m *Manager) ReuseIdlePolecat(name string, opts AddOptions) (*Polecat, erro
 
 	if !m.exists(name) {
 		return nil, ErrPolecatNotFound
+	}
+
+	// Re-check idle state after acquiring lock (hq-xqfo): FindIdlePolecat runs
+	// without a lock, so two concurrent slings can both find the same idle polecat.
+	// After acquiring the per-polecat lock, check if another process already hooked
+	// work to this polecat. A hooked bead is the definitive signal of concurrent reuse.
+	assignee := m.assigneeID(name)
+	hookedBeads, hookedErr := m.beads.List(beads.ListOptions{
+		Status:   beads.StatusHooked,
+		Assignee: assignee,
+		Priority: -1,
+	})
+	if hookedErr == nil && len(hookedBeads) > 0 {
+		return nil, fmt.Errorf("%w: %s has hooked bead %s (concurrent reuse detected)",
+			ErrPolecatNotIdle, name, hookedBeads[0].ID)
 	}
 
 	// Kill any existing session unconditionally before reuse.
