@@ -541,6 +541,12 @@ func (m *SessionManager) Stop(polecat string, force bool) error {
 		return fmt.Errorf("killing session: %w", err)
 	}
 
+	// Record kill timestamp for post-kill cooldown (v5 kaizen).
+	// Slinging to a polecat immediately after its session is killed can produce
+	// a dead session — the new tmux session starts but Claude never initializes.
+	// Writing a timestamp allows SpawnPolecatForSling to enforce a cooldown.
+	WriteKillTimestamp(m.rig.Path, polecat)
+
 	return nil
 }
 

@@ -156,6 +156,16 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 	idlePolecat, findErr := polecatMgr.FindIdlePolecat()
 	if findErr == nil && idlePolecat != nil {
 		polecatName := idlePolecat.Name
+
+		// Post-kill cooldown (v5 kaizen): if this polecat was recently killed,
+		// wait for the cooldown to expire before reusing. This prevents dead
+		// sessions caused by slinging too soon after a session kill.
+		if remaining := polecat.CheckKillCooldown(r.Path, polecatName); remaining > 0 {
+			fmt.Printf("  Cooldown: %s was killed %.0fs ago, waiting %.0fs...\n",
+				polecatName, (polecat.KillCooldown - remaining).Seconds(), remaining.Seconds())
+			time.Sleep(remaining)
+		}
+
 		fmt.Printf("Reusing idle polecat: %s\n", polecatName)
 
 		// Determine base branch

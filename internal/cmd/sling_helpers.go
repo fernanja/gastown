@@ -657,6 +657,39 @@ func nudgeRefinery(rigName, message string) {
 	}
 }
 
+// nudgeMayor notifies the mayor that a polecat completed work.
+// V5 kaizen: eliminates the mayor's polling loop by pushing completion events.
+// The mayor can react immediately to freed capacity instead of polling every 60s.
+func nudgeMayor(message string) {
+	mayorSession := session.MayorSessionName()
+
+	// Test hook: log nudge for test observability
+	if logPath := os.Getenv("GT_TEST_NUDGE_LOG"); logPath != "" {
+		entry := fmt.Sprintf("nudge:%s:%s\n", mayorSession, message)
+		f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err == nil {
+			_, _ = f.WriteString(entry)
+			_ = f.Close()
+		}
+		return
+	}
+
+	// Emit a file event so the mayor's await-event unblocks instantly.
+	townRoot, _ := workspace.FindFromCwd()
+	if townRoot != "" {
+		_, _ = channelevents.EmitToTown(townRoot, "mayor", "POLECAT_DONE", []string{
+			"source=polecat",
+			"message=" + message,
+		})
+	}
+
+	t := tmux.NewTmux()
+	if err := t.NudgeSession(mayorSession, message); err != nil {
+		// Non-fatal: mayor may not be running (e.g., tests, standalone polecats)
+		_ = err
+	}
+}
+
 // isPolecatTarget checks if the target string refers to a polecat.
 // Returns true if the target format is "rig/polecats/name".
 // This is used to determine if we should respawn a dead polecat

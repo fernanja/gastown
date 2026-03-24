@@ -401,7 +401,18 @@ type PolecatListItem struct {
 // causing the mayor to think work completed when it hadn't.
 func effectivePolecatState(item PolecatListItem, townRoot string) polecat.State {
 	state := item.State
-	// A running session overrides both "done" and "idle" — the polecat is working.
+	// V5 kaizen: check town.log for [done] even when session is running.
+	// With persistent polecats, the session stays alive after gt done (IDLE state).
+	// But state may still read "working" because the beads DB update races with
+	// session lifecycle. If town.log has a [done] entry for the current issue,
+	// the polecat completed — report as IDLE regardless of session state.
+	if item.SessionRunning && state == polecat.StateWorking {
+		if hasDoneInTownLog(townRoot, item.Rig, item.Name, item.Issue) {
+			return polecat.StateIdle
+		}
+		return polecat.StateWorking
+	}
+	// A running session overrides "done" and "idle" only if no town.log [done] exists.
 	// "idle" can be stale when a polecat is reused (cross-rig beads, stale heartbeat,
 	// or beads query timing), and "done" can be stale when gt done didn't complete.
 	if item.SessionRunning && (state == polecat.StateDone || state == polecat.StateIdle) {

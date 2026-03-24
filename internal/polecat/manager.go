@@ -1307,7 +1307,16 @@ func (m *Manager) AllocateName() (string, error) {
 		sessionName := session.PolecatSessionName(session.PrefixFor(m.rig.Name), name)
 		if alive, _ := m.tmux.HasSession(sessionName); alive {
 			_ = m.tmux.KillSessionWithProcesses(sessionName)
+			// Write kill timestamp for cooldown enforcement
+			WriteKillTimestamp(m.rig.Path, name)
 		}
+	}
+
+	// Post-kill cooldown (v5 kaizen): if this name was recently killed,
+	// wait before creating a new session. Prevents dead sessions from
+	// tmux/Claude initialization race.
+	if remaining := CheckKillCooldown(m.rig.Path, name); remaining > 0 {
+		time.Sleep(remaining)
 	}
 
 	return name, nil

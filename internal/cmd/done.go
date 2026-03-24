@@ -1052,6 +1052,11 @@ notifyWitness:
 	// Update agent bead state (ZFC: self-report completion)
 	updateAgentStateOnDone(cwd, townRoot, exitType, issueID)
 
+	// Completion callback (v5 kaizen): nudge the mayor so it can react immediately
+	// to freed capacity instead of polling. This eliminates the mayor's polling loop
+	// and reduces dispatch latency for batched work.
+	nudgeMayor(fmt.Sprintf("POLECAT_DONE %s/%s completed %s exit=%s", rigName, polecatName, issueID, exitType))
+
 	// Persistent polecat model (gt-hdf8): polecats transition to IDLE after completion.
 	// Session stays alive, sandbox preserved, worktree synced to main for reuse.
 	// "done means idle" - not "done means dead".
