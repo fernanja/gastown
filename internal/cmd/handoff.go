@@ -253,17 +253,6 @@ func runHandoff(cmd *cobra.Command, args []string) error {
 	// Handing off ourselves - print feedback then respawn
 	fmt.Printf("%s Handing off %s...\n", style.Bold.Render("🤝"), currentSession)
 
-	// Log handoff event (both townlog and events feed)
-	if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
-		agent := sessionToGTRole(currentSession)
-		if agent == "" {
-			agent = currentSession
-		}
-		_ = LogHandoff(townRoot, agent, handoffSubject)
-		// Also log to activity feed
-		_ = events.LogFeed(events.TypeHandoff, agent, events.HandoffPayload(handoffSubject, true))
-	}
-
 	// Dry run mode - show what would happen (BEFORE any side effects)
 	if handoffDryRun {
 		if handoffSubject != "" || handoffMessage != "" {
@@ -283,12 +272,34 @@ func runHandoff(cmd *cobra.Command, args []string) error {
 
 	// Send handoff mail to self (defaults applied inside sendHandoffMail).
 	// The mail is auto-hooked so the next session picks it up.
+	// CRITICAL: Mail must persist to Dolt BEFORE logging to town.log (hq-mv7).
+	// If Dolt is down, we must NOT log a false handoff to town.log.
 	beadID, err := sendHandoffMail(handoffSubject, handoffMessage)
 	if err != nil {
-		style.PrintWarning("could not send handoff mail: %v", err)
-		// Continue anyway - the respawn is more important
-	} else {
-		fmt.Printf("%s Sent handoff mail %s (auto-hooked)\n", style.Bold.Render("📬"), beadID)
+		// Handoff persistence failure is fatal — do not silently continue (hq-vy4).
+		// A silent failure causes the next session to find an empty hook, losing
+		// all handoff context. Better to fail loudly and let the human intervene.
+		agent := sessionToGTRole(currentSession)
+		if agent == "" {
+			agent = currentSession
+		}
+		if townRoot, trErr := workspace.FindFromCwd(); trErr == nil && townRoot != "" {
+			_ = LogHandoffNoPersist(townRoot, agent, handoffSubject, err)
+		}
+		return fmt.Errorf("handoff mail failed to persist (Dolt may be down): %w\n\nThe session was NOT respawned. Fix the issue and retry 'gt handoff'.", err)
+	}
+	fmt.Printf("%s Sent handoff mail %s (auto-hooked)\n", style.Bold.Render("📬"), beadID)
+
+	// Log handoff event AFTER Dolt persistence succeeds (hq-mv7).
+	// Previously this logged BEFORE sendHandoffMail, causing false entries in
+	// town.log when Dolt was down. Now town.log only records confirmed handoffs.
+	if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
+		agent := sessionToGTRole(currentSession)
+		if agent == "" {
+			agent = currentSession
+		}
+		_ = LogHandoff(townRoot, agent, handoffSubject)
+		_ = events.LogFeed(events.TypeHandoff, agent, events.HandoffPayload(handoffSubject, true))
 	}
 
 	// NOTE: reportAgentState("stopped") removed (gt-zecmc)
