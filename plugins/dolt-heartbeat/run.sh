@@ -99,8 +99,8 @@ CANARY_TITLE="dolt-heartbeat canary $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
 # Try to write a canary issue
 WRITE_RESULT=$(dolt_query "$HEARTBEAT_DB" "
-  INSERT INTO issues (id, title, description, status, priority, issue_type, ephemeral)
-  VALUES ('${CANARY_ID}', '${CANARY_TITLE}', 'Heartbeat canary — auto-deleted', 'closed', 4, 'chore', 1)
+  INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, ephemeral)
+  VALUES ('${CANARY_ID}', '${CANARY_TITLE}', 'Heartbeat canary — auto-deleted', '', '', '', 'closed', 4, 'chore', 1)
   ON DUPLICATE KEY UPDATE title='${CANARY_TITLE}', updated_at=NOW();
 " 2>&1)
 
