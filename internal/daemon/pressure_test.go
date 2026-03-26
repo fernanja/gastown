@@ -20,8 +20,8 @@ func TestIsAgentSession(t *testing.T) {
 		{"", false},
 	}
 	for _, tt := range tests {
-		if got := isAgentSession(tt.name); got != tt.want {
-			t.Errorf("isAgentSession(%q) = %v, want %v", tt.name, got, tt.want)
+		if got := IsAgentSession(tt.name); got != tt.want {
+			t.Errorf("IsAgentSession(%q) = %v, want %v", tt.name, got, tt.want)
 		}
 	}
 }

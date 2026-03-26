@@ -12,6 +12,8 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/daemon"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/lock"
 	"github.com/steveyegge/gastown/internal/mail"
@@ -135,6 +137,7 @@ var (
 	slingFormula       string // --formula: override formula for dispatch (default: mol-polecat-work)
 	slingCrew          string // --crew: target a crew member in the specified rig
 	slingReviewOnly    bool   // --review-only: mark work as review-only (no merge/commit/push)
+	slingForceBudget   bool   // --force-budget: skip session budget check
 )
 
 func init() {
@@ -163,6 +166,7 @@ func init() {
 	slingCmd.Flags().StringVar(&slingFormula, "formula", "", "Formula to apply (default: mol-polecat-work for polecat targets)")
 	slingCmd.Flags().StringVar(&slingCrew, "crew", "", "Target a crew member in the specified rig (e.g., --crew mel with target gastown → gastown/crew/mel)")
 	slingCmd.Flags().BoolVar(&slingReviewOnly, "review-only", false, "Mark work as review-only: assignee evaluates and reports back, must NOT merge/commit/push")
+	slingCmd.Flags().BoolVar(&slingForceBudget, "force-budget", false, "Skip session budget check (spawn even when at API session limit)")
 
 	slingCmd.AddCommand(slingRespawnResetCmd)
 	rootCmd.AddCommand(slingCmd)
@@ -656,13 +660,23 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	// that executeSling does not cover. The rig-target case could be factored out
 	// to use executeSling, limiting this to non-rig targets only.
 	//
-	// Resolve target agent using shared dispatch logic.
-	// Note: args[1] == args[len(args)-1] here because batch mode (len(args) > 2
-	// with rig last arg) exits at line 234. The only remaining case is len(args) <= 2.
+	// Session budget check: before spawning a polecat, verify we have API capacity.
+	// The Claude API limits concurrent sessions (~5). Background agents (deacon,
+	// witnesses, refineries, dogs) consume the same budget. If at capacity, report
+	// what's running and suggest what to stop — don't silently defer.
 	var target string
 	if len(args) > 1 {
 		target = args[1]
 	}
+	if _, isRig := IsRigName(target); isRig && !slingDryRun && !slingForceBudget && !slingForce && !slingNoBoot {
+		if err := checkSessionBudgetFn(target); err != nil {
+			return err
+		}
+	}
+
+	// Resolve target agent using shared dispatch logic.
+	// Note: args[1] == args[len(args)-1] here because batch mode (len(args) > 2
+	// with rig last arg) exits at line 234. The only remaining case is len(args) <= 2.
 	resolved, err := resolveTarget(target, ResolveTargetOptions{
 		DryRun:     slingDryRun,
 		Force:      force,
@@ -1189,4 +1203,67 @@ func rollbackSlingArtifacts(spawnInfo *SpawnedPolecatInfo, beadID, hookWorkDir, 
 
 	// 3. Clean up the spawned polecat (worktree, agent bead, convoy, etc.)
 	cleanupSpawnedPolecat(spawnInfo, spawnInfo.RigName, convoyID)
+}
+
+// DefaultMaxSessions is the default Claude API concurrent session limit.
+const DefaultMaxSessions = 5
+
+// checkSessionBudgetFn is the session budget check, swappable for testing.
+var checkSessionBudgetFn = checkSessionBudget
+
+// checkSessionBudget verifies there is API capacity to spawn a new polecat.
+// If at capacity, returns an actionable error listing active sessions and
+// suggesting which non-essential agents to stop.
+func checkSessionBudget(targetRig string) error {
+	sessions := daemon.ListAgentSessions()
+	active := len(sessions)
+
+	// Load configured max from town settings, fall back to default
+	maxSessions := DefaultMaxSessions
+	if townRoot, err := workspace.FindFromCwd(); err == nil {
+		settingsPath := filepath.Join(townRoot, "town-settings.json")
+		if settings, err := config.LoadOrCreateTownSettings(settingsPath); err == nil {
+			if op := settings.Operational; op != nil {
+				if th := op.Daemon; th != nil {
+					if v := th.PressureMaxSessionsV(); v > 0 {
+						maxSessions = v
+					}
+				}
+			}
+		}
+	}
+
+	if active < maxSessions {
+		return nil // Budget available
+	}
+
+	// Categorize sessions for actionable suggestions
+	var essential, stoppable []string
+	for _, name := range sessions {
+		switch {
+		case strings.Contains(name, "mayor"):
+			essential = append(essential, name)
+		case strings.Contains(name, "deacon"), strings.Contains(name, "boot"), strings.Contains(name, "dog"):
+			stoppable = append(stoppable, name+" (daemon agent)")
+		case strings.Contains(name, "witness"), strings.Contains(name, "refinery"):
+			stoppable = append(stoppable, name+" (rig agent)")
+		default:
+			stoppable = append(stoppable, name)
+		}
+	}
+
+	msg := fmt.Sprintf("session budget exhausted: %d/%d active sessions\n\n", active, maxSessions)
+	msg += "Active sessions:\n"
+	for _, s := range essential {
+		msg += fmt.Sprintf("  %s (essential)\n", s)
+	}
+	for _, s := range stoppable {
+		msg += fmt.Sprintf("  %s\n", s)
+	}
+	msg += fmt.Sprintf("\nTo free slots, stop non-essential agents:\n")
+	msg += fmt.Sprintf("  gt rig dock <rig>           # Dock rigs you don't need right now\n")
+	msg += fmt.Sprintf("  gt rig stop %s        # Stop target rig agents (witness+refinery)\n", targetRig)
+	msg += fmt.Sprintf("\nOr override: gt sling --force-budget <bead> %s", targetRig)
+
+	return fmt.Errorf("%s", msg)
 }

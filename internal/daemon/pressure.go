@@ -93,6 +93,12 @@ func (d *Daemon) checkPressure(_ string) PressureResult {
 // countAgentSessions counts active tmux sessions that belong to Gas Town agents.
 // Uses the town's tmux socket so it only counts sessions for this town.
 func (d *Daemon) countAgentSessions() int {
+	return CountAgentSessions()
+}
+
+// CountAgentSessions counts active tmux sessions that belong to Gas Town agents.
+// Exported so sling and other commands can check session budget without importing daemon.
+func CountAgentSessions() int {
 	t := tmux.NewTmux()
 	sessions, err := t.ListSessions()
 	if err != nil {
@@ -101,16 +107,34 @@ func (d *Daemon) countAgentSessions() int {
 
 	count := 0
 	for _, name := range sessions {
-		if isAgentSession(name) {
+		if IsAgentSession(name) {
 			count++
 		}
 	}
 	return count
 }
 
-// isAgentSession returns true if the tmux session name looks like a Gas Town agent.
+// ListAgentSessions returns the names of active Gas Town agent tmux sessions.
+func ListAgentSessions() []string {
+	t := tmux.NewTmux()
+	sessions, err := t.ListSessions()
+	if err != nil {
+		return nil
+	}
+
+	var agents []string
+	for _, name := range sessions {
+		if IsAgentSession(name) {
+			agents = append(agents, name)
+		}
+	}
+	return agents
+}
+
+// IsAgentSession returns true if the tmux session name looks like a Gas Town agent.
 // Agent sessions use prefixed names (e.g., "hq-mayor", "rig-witness", "rig-polecat-foo").
-func isAgentSession(name string) bool {
+// Exported so sling can categorize sessions for budget reporting.
+func IsAgentSession(name string) bool {
 	// Agent sessions contain role markers
 	for _, marker := range []string{
 		constants.RoleMayor,
