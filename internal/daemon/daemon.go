@@ -535,6 +535,18 @@ func (d *Daemon) Run() error {
 		d.logger.Printf("Main branch test ticker started (interval %v)", interval)
 	}
 
+	// Start quota dog ticker if configured.
+	// Scans for rate-limited sessions and automatically rotates credentials.
+	var quotaDogTicker *time.Ticker
+	var quotaDogChan <-chan time.Time
+	if d.isPatrolActive("quota_dog") {
+		interval := quotaDogInterval(d.patrolConfig)
+		quotaDogTicker = time.NewTicker(interval)
+		quotaDogChan = quotaDogTicker.C
+		defer quotaDogTicker.Stop()
+		d.logger.Printf("Quota dog ticker started (interval %v)", interval)
+	}
+
 	// Note: PATCH-010 uses per-session hooks in deacon/manager.go (SetAutoRespawnHook).
 	// Global pane-died hooks don't fire reliably in tmux 3.2a, so we rely on the
 	// per-session approach which has been tested to work for continuous recovery.
@@ -634,6 +646,13 @@ func (d *Daemon) Run() error {
 			// rig's main branch to catch regressions from merges or direct pushes.
 			if !d.isShutdownInProgress() {
 				d.runMainBranchTests()
+			}
+
+		case <-quotaDogChan:
+			// Quota dog — scans for rate-limited sessions and automatically
+			// rotates credentials to available accounts via keychain swap.
+			if !d.isShutdownInProgress() {
+				d.runQuotaDog()
 			}
 
 		case <-timer.C:
