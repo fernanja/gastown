@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	beadsdk "github.com/steveyegge/beads"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/git"
@@ -18,6 +20,78 @@ import (
 )
 
 // Note: Agent field parsing is now in internal/beads/fields.go (AgentFields, ParseAgentFields)
+
+// openHookStores opens in-process beadsdk.Storage connections for the hook status
+// lookup hot path. This eliminates ~600ms of subprocess overhead per bd call by
+// bypassing exec.Command("bd") and querying Dolt SQL directly.
+//
+// Opens one store per unique beads directory: workDir, town HQ, and each rig from
+// routes.jsonl. Returns a map keyed by resolved beads directory path and a cleanup
+// function that closes all stores. If any individual store fails to open, it is
+// silently skipped (the corresponding Beads instance falls back to subprocess).
+func openHookStores(ctx context.Context, townRoot, workDir string) (map[string]beadsdk.Storage, func()) {
+	stores := make(map[string]beadsdk.Storage)
+	noop := func() {}
+
+	// Helper: open and register a store for a beads directory if not already open.
+	tryOpen := func(dir string) {
+		resolved := beads.ResolveBeadsDir(dir)
+		if resolved == "" {
+			return
+		}
+		if _, exists := stores[resolved]; exists {
+			return
+		}
+		if _, err := os.Stat(resolved); os.IsNotExist(err) {
+			return
+		}
+		store, err := beadsdk.OpenFromConfig(ctx, resolved)
+		if err != nil {
+			return
+		}
+		stores[resolved] = store
+	}
+
+	// Open store for the primary workDir
+	tryOpen(workDir)
+
+	// Open store for town-level HQ beads
+	tryOpen(filepath.Join(townRoot, ".beads"))
+
+	// Open stores for all rigs from routes.jsonl
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+	if routes, err := beads.LoadRoutes(townBeadsDir); err == nil {
+		for _, route := range routes {
+			var rigDir string
+			if filepath.IsAbs(route.Path) {
+				rigDir = route.Path
+			} else {
+				rigDir = filepath.Join(townRoot, route.Path)
+			}
+			tryOpen(rigDir)
+		}
+	}
+
+	if len(stores) == 0 {
+		return stores, noop
+	}
+
+	cleanup := func() {
+		for _, store := range stores {
+			_ = store.Close()
+		}
+	}
+	return stores, cleanup
+}
+
+// injectStore sets the in-process store on a Beads instance if one is available
+// in the stores map for that instance's beads directory.
+func injectStore(b *beads.Beads, dir string, stores map[string]beadsdk.Storage) {
+	resolved := beads.ResolveBeadsDir(dir)
+	if store, ok := stores[resolved]; ok {
+		b.SetStore(store)
+	}
+}
 
 // buildAgentBeadID constructs the agent bead ID from an agent identity.
 // Uses canonical naming: prefix-rig-role-name
@@ -378,7 +452,13 @@ func runMoleculeStatus(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Open in-process stores to bypass bd subprocess overhead (~600ms/call).
+	// Falls back gracefully to subprocess if stores can't be opened.
+	stores, cleanupStores := openHookStores(context.Background(), townRoot, workDir)
+	defer cleanupStores()
+
 	b := beads.New(workDir)
+	injectStore(b, workDir, stores)
 
 	// Build status info
 	status := MoleculeStatusInfo{
@@ -398,6 +478,7 @@ func runMoleculeStatus(cmd *cobra.Command, args []string) error {
 			agentB := b
 			if agentBeadPath != workDir {
 				agentB = beads.New(agentBeadPath)
+				injectStore(agentB, agentBeadPath, stores)
 			}
 			agentBead, err := agentB.Show(agentBeadID)
 			if err == nil && beads.IsAgentBead(agentBead) {
@@ -430,7 +511,7 @@ func runMoleculeStatus(cmd *cobra.Command, args []string) error {
 
 		// For town-level roles (mayor, deacon), scan all rigs if nothing found locally
 		if len(hookedBeads) == 0 && isTownLevelRole(target) {
-			hookedBeads = scanAllRigsForHookedBeads(townRoot, target)
+			hookedBeads = scanAllRigsForHookedBeads(townRoot, target, stores)
 		}
 
 		// For rig-level agents (polecats, crew), also search town-level beads.
@@ -438,7 +519,9 @@ func runMoleculeStatus(cmd *cobra.Command, args []string) error {
 		// townRoot/.beads, not the rig's .beads database.
 		// See: https://github.com/steveyegge/gastown/issues/1438
 		if len(hookedBeads) == 0 && !isTownLevelRole(target) && townRoot != "" {
-			townB := beads.New(filepath.Join(townRoot, ".beads"))
+			townBeadsPath := filepath.Join(townRoot, ".beads")
+			townB := beads.New(townBeadsPath)
+			injectStore(townB, townBeadsPath, stores)
 			if townHooked, err := townB.List(beads.ListOptions{
 				Status:   beads.StatusHooked,
 				Assignee: target,
@@ -1192,7 +1275,7 @@ func extractMailSender(labels []string) string {
 // scanAllRigsForHookedBeads scans all registered rigs for hooked beads
 // assigned to the target agent. Used for town-level roles that may have
 // work hooked in any rig.
-func scanAllRigsForHookedBeads(townRoot, target string) []*beads.Issue {
+func scanAllRigsForHookedBeads(townRoot, target string, stores map[string]beadsdk.Storage) []*beads.Issue {
 	// Load routes from town beads
 	townBeadsDir := filepath.Join(townRoot, ".beads")
 	routes, err := beads.LoadRoutes(townBeadsDir)
@@ -1215,6 +1298,7 @@ func scanAllRigsForHookedBeads(townRoot, target string) []*beads.Issue {
 		}
 
 		b := beads.New(rigBeadsDir)
+		injectStore(b, rigBeadsDir, stores)
 		// First check for hooked beads
 		hookedBeads, err := b.List(beads.ListOptions{
 			Status:   beads.StatusHooked,

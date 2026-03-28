@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -497,7 +498,16 @@ func runHookShow(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Open in-process stores to bypass bd subprocess overhead.
+	townRootForStores, _ := workspace.FindFromCwd()
+	if townRootForStores == "" {
+		townRootForStores, _ = findTownRoot()
+	}
+	stores, cleanupStores := openHookStores(context.Background(), townRootForStores, workDir)
+	defer cleanupStores()
+
 	b := beads.New(workDir)
+	injectStore(b, workDir, stores)
 	// Query for hooked beads assigned to the target
 	hookedBeads, err := b.List(beads.ListOptions{
 		Status:   beads.StatusHooked,
@@ -518,6 +528,7 @@ func runHookShow(cmd *cobra.Command, args []string) error {
 			townBeadsDir := filepath.Join(townRoot, ".beads")
 			if _, err := os.Stat(townBeadsDir); err == nil {
 				townBeads := beads.New(townBeadsDir)
+				injectStore(townBeads, townBeadsDir, stores)
 				townHooked, err := townBeads.List(beads.ListOptions{
 					Status:   beads.StatusHooked,
 					Assignee: target,
@@ -530,7 +541,7 @@ func runHookShow(cmd *cobra.Command, args []string) error {
 
 			// If still nothing found and town-level role, scan all rigs
 			if len(hookedBeads) == 0 && isTownLevelRole(target) {
-				hookedBeads = scanAllRigsForHookedBeads(townRoot, target)
+				hookedBeads = scanAllRigsForHookedBeads(townRoot, target, stores)
 			}
 		}
 	}
