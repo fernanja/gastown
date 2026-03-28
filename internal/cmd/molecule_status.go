@@ -21,75 +21,112 @@ import (
 
 // Note: Agent field parsing is now in internal/beads/fields.go (AgentFields, ParseAgentFields)
 
-// openHookStores opens in-process beadsdk.Storage connections for the hook status
-// lookup hot path. This eliminates ~600ms of subprocess overhead per bd call by
-// bypassing exec.Command("bd") and querying Dolt SQL directly.
+// storePool manages lazy, cached in-process beadsdk.Storage connections.
 //
-// Opens one store per unique beads directory: workDir, town HQ, and each rig from
-// routes.jsonl. Returns a map keyed by resolved beads directory path and a cleanup
-// function that closes all stores. If any individual store fails to open, it is
-// silently skipped (the corresponding Beads instance falls back to subprocess).
-func openHookStores(ctx context.Context, townRoot, workDir string) (map[string]beadsdk.Storage, func()) {
-	stores := make(map[string]beadsdk.Storage)
-	noop := func() {}
-
-	// Helper: open and register a store for a beads directory if not already open.
-	tryOpen := func(dir string) {
-		resolved := beads.ResolveBeadsDir(dir)
-		if resolved == "" {
-			return
-		}
-		if _, exists := stores[resolved]; exists {
-			return
-		}
-		if _, err := os.Stat(resolved); os.IsNotExist(err) {
-			return
-		}
-		store, err := beadsdk.OpenFromConfig(ctx, resolved)
-		if err != nil {
-			return
-		}
-		stores[resolved] = store
-	}
-
-	// Open store for the primary workDir
-	tryOpen(workDir)
-
-	// Open store for town-level HQ beads
-	tryOpen(filepath.Join(townRoot, ".beads"))
-
-	// Open stores for all rigs from routes.jsonl
-	townBeadsDir := filepath.Join(townRoot, ".beads")
-	if routes, err := beads.LoadRoutes(townBeadsDir); err == nil {
-		for _, route := range routes {
-			var rigDir string
-			if filepath.IsAbs(route.Path) {
-				rigDir = route.Path
-			} else {
-				rigDir = filepath.Join(townRoot, route.Path)
-			}
-			tryOpen(rigDir)
-		}
-	}
-
-	if len(stores) == 0 {
-		return stores, noop
-	}
-
-	cleanup := func() {
-		for _, store := range stores {
-			_ = store.Close()
-		}
-	}
-	return stores, cleanup
+// Each gt command (hook, mail, status) queries multiple beads databases via
+// exec.Command("bd") at ~600ms per subprocess. storePool replaces this with
+// direct SQL connections that are opened lazily on first access and closed
+// together when the command finishes.
+//
+// Concurrency: storePool is designed for sequential use within a single
+// goroutine. The underlying *sql.DB is thread-safe, but DOLT_CHECKOUT
+// (branch selection) is session-level, so concurrent queries from different
+// Beads instances sharing one store could see inconsistent branch state.
+// This is safe here because all callers in runMoleculeStatus and runHookShow
+// are sequential.
+//
+// Fallback: if a store cannot be opened (Dolt server down, missing database,
+// permission error), the Beads instance operates without a store and falls
+// back to the bd subprocess automatically. This is a performance degradation,
+// not a correctness issue.
+type storePool struct {
+	ctx     context.Context
+	stores  map[string]beadsdk.Storage // key: resolved beads dir path
+	resolve map[string]string          // key: raw dir → resolved beads dir (cache)
+	failed  map[string]bool            // key: resolved dir → true if open failed (avoid retries)
 }
 
-// injectStore sets the in-process store on a Beads instance if one is available
-// in the stores map for that instance's beads directory.
-func injectStore(b *beads.Beads, dir string, stores map[string]beadsdk.Storage) {
+// newStorePool creates a pool that opens stores lazily using the given context.
+// The context should come from cmd.Context() to respect Ctrl+C cancellation.
+// Call pool.close() when done (typically via defer).
+func newStorePool(ctx context.Context) *storePool {
+	return &storePool{
+		ctx:     ctx,
+		stores:  make(map[string]beadsdk.Storage),
+		resolve: make(map[string]string),
+		failed:  make(map[string]bool),
+	}
+}
+
+// resolveDir returns the resolved beads directory for dir, caching the result.
+// Returns "" if dir has no .beads directory.
+func (p *storePool) resolveDir(dir string) string {
+	if cached, ok := p.resolve[dir]; ok {
+		return cached
+	}
 	resolved := beads.ResolveBeadsDir(dir)
-	if store, ok := stores[resolved]; ok {
+	p.resolve[dir] = resolved
+	return resolved
+}
+
+// get returns the store for a beads directory, opening it lazily on first access.
+// Returns nil if the directory doesn't exist, has no beads config, or the store
+// can't be opened. Failed opens are cached to avoid repeated attempts.
+func (p *storePool) get(dir string) beadsdk.Storage {
+	resolved := p.resolveDir(dir)
+	if resolved == "" {
+		return nil
+	}
+	if store, ok := p.stores[resolved]; ok {
+		return store
+	}
+	if p.failed[resolved] {
+		return nil
+	}
+	if _, err := os.Stat(resolved); err != nil {
+		p.failed[resolved] = true
+		return nil
+	}
+	// OpenFromConfig opens a SQL connection to the running Dolt server.
+	// It does NOT spawn subprocesses when the server is already running
+	// (it uses TCP dial + MySQL protocol). If the server is down and
+	// auto-start is enabled, it may start one — but in Gas Town the
+	// server is managed by gt up, so auto-start is disabled.
+	store, err := beadsdk.OpenFromConfig(p.ctx, resolved)
+	if err != nil {
+		p.failed[resolved] = true
+		fmt.Fprintf(os.Stderr, "warning: store open failed for %s: %v (using subprocess fallback)\n", resolved, err)
+		return nil
+	}
+	p.stores[resolved] = store
+	return store
+}
+
+// inject sets the in-process store on a Beads instance if one is available.
+// If no store can be opened for dir, the Beads instance is left unchanged
+// and will use the bd subprocess path.
+func (p *storePool) inject(b *beads.Beads, dir string) {
+	if store := p.get(dir); store != nil {
 		b.SetStore(store)
+	}
+}
+
+// cmdContext returns the command's context, or context.Background() if cmd is nil.
+// Some tests invoke run functions with a nil *cobra.Command; this avoids a panic.
+func cmdContext(cmd *cobra.Command) context.Context {
+	if cmd != nil {
+		return cmd.Context()
+	}
+	return context.Background()
+}
+
+// close closes all open stores. Errors are logged to stderr but not returned,
+// since close is called in defer and callers cannot act on close failures.
+func (p *storePool) close() {
+	for path, store := range p.stores {
+		if err := store.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to close store %s: %v\n", path, err)
+		}
 	}
 }
 
@@ -452,13 +489,13 @@ func runMoleculeStatus(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Open in-process stores to bypass bd subprocess overhead (~600ms/call).
-	// Falls back gracefully to subprocess if stores can't be opened.
-	stores, cleanupStores := openHookStores(context.Background(), townRoot, workDir)
-	defer cleanupStores()
+	// Open in-process stores lazily to bypass bd subprocess overhead (~600ms/call).
+	// Stores are opened on first access and closed when this function returns.
+	pool := newStorePool(cmdContext(cmd))
+	defer pool.close()
 
 	b := beads.New(workDir)
-	injectStore(b, workDir, stores)
+	pool.inject(b, workDir)
 
 	// Build status info
 	status := MoleculeStatusInfo{
@@ -478,7 +515,7 @@ func runMoleculeStatus(cmd *cobra.Command, args []string) error {
 			agentB := b
 			if agentBeadPath != workDir {
 				agentB = beads.New(agentBeadPath)
-				injectStore(agentB, agentBeadPath, stores)
+				pool.inject(agentB, agentBeadPath)
 			}
 			agentBead, err := agentB.Show(agentBeadID)
 			if err == nil && beads.IsAgentBead(agentBead) {
@@ -511,7 +548,7 @@ func runMoleculeStatus(cmd *cobra.Command, args []string) error {
 
 		// For town-level roles (mayor, deacon), scan all rigs if nothing found locally
 		if len(hookedBeads) == 0 && isTownLevelRole(target) {
-			hookedBeads = scanAllRigsForHookedBeads(townRoot, target, stores)
+			hookedBeads = scanAllRigsForHookedBeads(townRoot, target, pool)
 		}
 
 		// For rig-level agents (polecats, crew), also search town-level beads.
@@ -521,7 +558,7 @@ func runMoleculeStatus(cmd *cobra.Command, args []string) error {
 		if len(hookedBeads) == 0 && !isTownLevelRole(target) && townRoot != "" {
 			townBeadsPath := filepath.Join(townRoot, ".beads")
 			townB := beads.New(townBeadsPath)
-			injectStore(townB, townBeadsPath, stores)
+			pool.inject(townB, townBeadsPath)
 			if townHooked, err := townB.List(beads.ListOptions{
 				Status:   beads.StatusHooked,
 				Assignee: target,
@@ -1275,7 +1312,7 @@ func extractMailSender(labels []string) string {
 // scanAllRigsForHookedBeads scans all registered rigs for hooked beads
 // assigned to the target agent. Used for town-level roles that may have
 // work hooked in any rig.
-func scanAllRigsForHookedBeads(townRoot, target string, stores map[string]beadsdk.Storage) []*beads.Issue {
+func scanAllRigsForHookedBeads(townRoot, target string, pool *storePool) []*beads.Issue {
 	// Load routes from town beads
 	townBeadsDir := filepath.Join(townRoot, ".beads")
 	routes, err := beads.LoadRoutes(townBeadsDir)
@@ -1298,7 +1335,7 @@ func scanAllRigsForHookedBeads(townRoot, target string, stores map[string]beadsd
 		}
 
 		b := beads.New(rigBeadsDir)
-		injectStore(b, rigBeadsDir, stores)
+		pool.inject(b, rigBeadsDir)
 		// First check for hooked beads
 		hookedBeads, err := b.List(beads.ListOptions{
 			Status:   beads.StatusHooked,
