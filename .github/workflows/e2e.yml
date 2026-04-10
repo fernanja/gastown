@@ -1,9 +1,11 @@
 name: E2E Tests
 
 on:
-  schedule:
-    - cron: '0 6 * * *'  # Daily at 6am UTC
-  workflow_dispatch:       # Allow manual trigger
+  # Scheduled trigger disabled — gastown is in maintenance freeze for cutover
+  # to gas city. Re-add the cron line below to resume nightly runs.
+  #   schedule:
+  #     - cron: '0 6 * * *'  # Daily at 6am UTC
+  workflow_dispatch:       # Manual triggering still available
 
 jobs:
   e2e:

@@ -1,9 +1,11 @@
 name: Nightly Integration Tests
 
 on:
-  schedule:
-    - cron: '0 6 * * *' # 06:00 UTC daily
-  workflow_dispatch: # Allow manual triggering
+  # Scheduled trigger disabled — gastown is in maintenance freeze for cutover
+  # to gas city. Re-add the cron line below to resume nightly runs.
+  #   schedule:
+  #     - cron: '0 6 * * *' # 06:00 UTC daily
+  workflow_dispatch: # Manual triggering still available
 
 jobs:
   integration-full:
